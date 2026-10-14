@@ -707,15 +707,17 @@ void ZedCamera::getDepthParams()
 #endif
     }
 
+    double pc_pub_rate = mPcPubRate;
     sl_tools::getParam(
-      shared_from_this(), "depth.point_cloud_freq", mPcPubRate,
-      mPcPubRate, "", true, -1.0, static_cast<double>(mCamGrabFrameRate));
-    if (mPcPubRate <= 0.0) {
-      mPcPubRate = static_cast<double>(mCamGrabFrameRate);
+      shared_from_this(), "depth.point_cloud_freq", pc_pub_rate,
+      pc_pub_rate, "", true, -1.0, static_cast<double>(mCamGrabFrameRate));
+    if (pc_pub_rate <= 0.0) {
+      pc_pub_rate = static_cast<double>(mCamGrabFrameRate);
     }
+    mPcPubRate = pc_pub_rate;
     RCLCPP_INFO_STREAM(
       get_logger(),
-      " * Point cloud rate [Hz]: " << mPcPubRate);
+      " * Point cloud rate [Hz]: " << pc_pub_rate);
 
     std::string out_resol = "COMPACT";
     sl_tools::getParam(
@@ -1078,8 +1080,52 @@ bool ZedCamera::isDepthRequired()
   return tot_sub > 0 || depth_required_for_pos_trk || depth_required_for_od;
 }
 
+bool ZedCamera::isDepthRequiredEveryFrame()
+{
+  bool depth_required_for_pos_trk = isPosTrackingRequired();
+#if (ZED_SDK_MAJOR_VERSION * 10 + ZED_SDK_MINOR_VERSION) >= 52
+  // Positional Tracking `GEN_3` does not need depth
+  depth_required_for_pos_trk = depth_required_for_pos_trk &&
+    (mPosTrkMode != sl::POSITIONAL_TRACKING_MODE::GEN_3);
+#endif
+
+  return depth_required_for_pos_trk || mObjDetRunning || mBodyTrkRunning ||
+         mSpatialMappingRunning;
+}
+
+bool ZedCamera::isGrabRequiredEveryFrame()
+{
+  // Modules processed by grab() on every frame, with or without depth
+  bool auto_roi_running = mAutoRoiEnabled &&
+    (mAutoRoiStatus != sl::REGION_OF_INTEREST_AUTO_DETECTION_STATE::READY);
+
+  return isPosTrackingRequired() || mObjDetRunning || mBodyTrkRunning ||
+         mSpatialMappingRunning || auto_roi_running;
+}
+
+bool ZedCamera::isPointCloudFrame()
+{
+  double now_sec = get_clock()->now().seconds();
+  double pc_period_sec = 1.0 / mPcPubRate.load();
+
+  // Point cloud on the grab closest to the scheduled time
+  if (now_sec < mNextPcTime_sec - 0.5 * mGrabPeriodMean_sec->getAvg()) {
+    return false;
+  }
+
+  // Schedule from the previous target to keep the mean rate; restart if late (stall or slow grab)
+  mNextPcTime_sec += pc_period_sec;
+  if (mNextPcTime_sec <= now_sec) {
+    mNextPcTime_sec = now_sec + pc_period_sec;
+  }
+
+  return true;
+}
+
 void ZedCamera::applyDepthSettings()
 {
+  mPcFrame = isPointCloudFrame();
+
   if (isDepthRequired()) {
     std::lock_guard<std::mutex> lock(mDynParMutex);
     mRunParams.confidence_threshold =
@@ -1088,8 +1134,11 @@ void ZedCamera::applyDepthSettings()
       mDepthTextConf;      // Update depth texture confidence if changed
     mRunParams.remove_saturated_areas = mRemoveSatAreas;
 
-    DEBUG_STREAM_COMM("Depth processing enabled");
-    mRunParams.enable_depth = true;
+    // Depth only on point cloud grabs, unless a module needs it on every grab
+    mRunParams.enable_depth = mPcFrame || isDepthRequiredEveryFrame();
+    DEBUG_STREAM_COMM(
+      "Depth processing " << (mRunParams.enable_depth ? "enabled" : "skipped") <<
+        " on this grab");
 
   } else {
     DEBUG_STREAM_COMM("Depth processing disabled");
@@ -1504,11 +1553,15 @@ void ZedCamera::retrieveVideoDepth(bool gpu)
     DEBUG_STREAM_VD(" *** Video Data retrieved ***");
   }
 
-  DEBUG_STREAM_VD(" *** Retrieving Depth Data ***");
-  retrieved_depth |= retrieveDepthMap(gpu);
-  retrieved_depth |= retrieveConfidence(gpu);
-  retrieved_depth |= retrieveDisparityMap();
-  retrieved_depth |= retrieveDepthInfo();
+  // Depth data exist only on grabs with depth enabled
+  if (mRunParams.enable_depth) {
+    DEBUG_STREAM_VD(" *** Retrieving Depth Data ***");
+    retrieved_depth |= retrieveDepthMap(gpu);
+    retrieved_depth |= retrieveConfidence(gpu);
+    retrieved_depth |= retrieveDisparityMap();
+    retrieved_depth |= retrieveDepthInfo();
+  }
+  mDepthRetrieved = retrieved_depth;
 
   if (retrieved_depth) {
     DEBUG_STREAM_VD(" *** Depth Data retrieved ***");
@@ -1785,7 +1838,7 @@ void ZedCamera::checkRgbDepthSync()
   sl::Timestamp ts_rgb = 0;
   sl::Timestamp ts_depth = 0;
 
-  if (mRgbSubscribed && (mDepthSubCount > 0 || mDepthInfoSubCount > 0)) {
+  if (mRgbSubscribed && mDepthRetrieved && (mDepthSubCount > 0 || mDepthInfoSubCount > 0)) {
     ts_rgb = mMatLeft.timestamp;
     ts_depth = mMatDepth.timestamp;
 
@@ -2161,7 +2214,9 @@ void ZedCamera::publishStereoRawImages(const rclcpp::Time & t)
 void ZedCamera::publishDepthImage(const rclcpp::Time & t)
 {
   if (mDepthSubCount > 0) {
-    publishDepthMapWithInfo(mMatDepth, t);
+    if (mDepthRetrieved) {
+      publishDepthMapWithInfo(mMatDepth, t);
+    }
   } else {
     publishCameraInfo(mPubDepthCamInfo, mLeftCamInfoMsg, t);
     publishCameraInfo(mPubDepthCamInfoTrans, mLeftCamInfoMsg, t);
@@ -2172,6 +2227,9 @@ void ZedCamera::publishConfidenceMap(const rclcpp::Time & t)
 {
   if (mConfMapSubCount > 0) {
     DEBUG_STREAM_VD(" * mConfMapSubCount: " << mConfMapSubCount);
+    if (!mDepthRetrieved) {
+      return;
+    }
     if (_nitrosDisabled) {
       publishImageWithInfo(
         mMatConf, mPubIpcConfMap, mPubConfMap, mPubConfMapCamInfo, mPubConfMapCamInfoTrans,
@@ -2191,14 +2249,16 @@ void ZedCamera::publishConfidenceMap(const rclcpp::Time & t)
 
 void ZedCamera::publishDisparity(const rclcpp::Time & t)
 {
-  if (mDisparitySubCount > 0 || mDispMapSubCount > 0 || mDispImgSubCount > 0) {
+  if ((mDisparitySubCount > 0 || mDispMapSubCount > 0 || mDispImgSubCount > 0) &&
+    mDepthRetrieved)
+  {
     publishDisparityMap(mMatDispMap, t);
   }
 }
 
 void ZedCamera::publishDepthInfo(const rclcpp::Time & t)
 {
-  if (mDepthInfoSubCount > 0) {
+  if (mDepthInfoSubCount > 0 && mDepthRetrieved) {
     auto depthInfoMsg = std::make_unique<zed_msgs::msg::DepthInfoStamped>();
     depthInfoMsg->header.stamp = mUsePubTimestamps ? get_clock()->now() : t;
     depthInfoMsg->header.frame_id = mDepthOptFrameId;
@@ -3140,27 +3200,8 @@ bool ZedCamera::waitForPointCloudData(std::unique_lock<std::mutex> & lock)
 
 void ZedCamera::handlePointCloudPublishing()
 {
+  // Rate is set by the grab thread (see isPointCloudFrame())
   publishPointCloud();
-
-  // ----> Check publishing frequency
-  double pc_period_usec = 1e6 / mPcPubRate;
-
-  double elapsed_usec = mPcPubFreqTimer.toc() * 1e6;
-
-  DEBUG_STREAM_PC(" * [handlePointCloudPublishing] elapsed_usec " << elapsed_usec);
-
-  int wait_usec = 100;
-  if (elapsed_usec < pc_period_usec) {
-    wait_usec = static_cast<int>(pc_period_usec - elapsed_usec);
-    rclcpp::sleep_for(std::chrono::microseconds(wait_usec));
-    DEBUG_STREAM_PC(" * [handlePointCloudPublishing] wait_usec " << wait_usec);
-  } else {
-    rclcpp::sleep_for(std::chrono::microseconds(wait_usec));
-  }
-  DEBUG_STREAM_PC(" * [handlePointCloudPublishing] sleeped for " << wait_usec << " µsec");
-
-  mPcPubFreqTimer.tic();
-  // <---- Check publishing frequency
 
   mPcDataReady = false;
 }

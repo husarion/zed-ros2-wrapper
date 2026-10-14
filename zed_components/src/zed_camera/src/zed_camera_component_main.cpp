@@ -82,7 +82,6 @@ ZedCamera::ZedCamera(const rclcpp::NodeOptions & options)
   mMagFreqTimer(get_clock()),              // 1081
   mOdomFreqTimer(get_clock()),             // 1082
   mPoseFreqTimer(get_clock()),             // 1083
-  mPcPubFreqTimer(get_clock()),            // 1084
   mVdPubFreqTimer(get_clock()),            // 1085
   mSensPubFreqTimer(get_clock()),          // 1086
   mOdFreqTimer(get_clock()),               // 1087
@@ -3263,7 +3262,7 @@ bool ZedCamera::startCamera()
       RCLCPP_WARN_STREAM(
         get_logger(),
         "PointCloud publishing rate was too high ["
-          << mPcPubRate << "], capped to real grab rate: "
+          << mPcPubRate.load() << "], capped to real grab rate: "
           << mCamGrabFrameRate);
     }
     // <---- Check publishing rates
@@ -3904,7 +3903,7 @@ bool ZedCamera::startCamera()
   mImuPeriodMean_sec = std::make_unique<sl_tools::WinAvg>(20);
   mBaroPeriodMean_sec = std::make_unique<sl_tools::WinAvg>(20);
   mMagPeriodMean_sec = std::make_unique<sl_tools::WinAvg>(20);
-  mPubFusedCloudPeriodMean_sec = std::make_unique<sl_tools::WinAvg>(mPcPubRate);
+  mPubFusedCloudPeriodMean_sec = std::make_unique<sl_tools::WinAvg>(mPcPubRate.load());
   mPubOdomTF_sec = std::make_unique<sl_tools::WinAvg>(mSensPubRate);
   mPubPoseTF_sec = std::make_unique<sl_tools::WinAvg>(mSensPubRate);
   mPubImuTF_sec = std::make_unique<sl_tools::WinAvg>(mSensPubRate);
@@ -5286,13 +5285,17 @@ void ZedCamera::threadFunc_zedGrab()
       // ----> Safe grab
       {
         std::lock_guard<std::mutex> grab_lock(mGrabMutex);
-        if (isDepthRequired() || isPosTrackingRequired()) {
+        if (isGrabRequiredEveryFrame()) {
           DEBUG_STREAM_GRAB("Grab thread: grabbing...");
           mGrabStatus = mZed->grab(mRunParams);  // Process the full pipeline with depth
 
         } else {
           DEBUG_GRAB("Grab thread: reading...");
           mGrabStatus = mZed->read();  // Image and sensor data reading with no depth processing
+          if (mGrabStatus == sl::ERROR_CODE::SUCCESS && mRunParams.enable_depth) {
+            // Depth on the frame just read: grab() does not read a new frame after read()
+            mGrabStatus = mZed->grab(mRunParams);
+          }
         }
       }
       // <---- Safe grab
@@ -5509,7 +5512,7 @@ void ZedCamera::threadFunc_zedGrab()
       processVideoDepth();
       // <---- Retrieve Image/Depth data if someone has subscribed to
 
-      if (!mDepthDisabled) {
+      if (!mDepthDisabled && mPcFrame) {
         // ----> Retrieve the point cloud if someone has subscribed to
         DEBUG_STREAM_GRAB("Grab thread: retrieving Point Cloud data");
         processPointCloud();

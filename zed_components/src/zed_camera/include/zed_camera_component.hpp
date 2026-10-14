@@ -371,6 +371,9 @@ protected:
   bool isDepthRequired();
   bool updatePosTrackingSubscribers(bool force = false);
   bool isPosTrackingRequired();
+  bool isDepthRequiredEveryFrame();
+  bool isGrabRequiredEveryFrame();
+  bool isPointCloudFrame();
 
   void applyVideoSettings();
   // Robustly enforce a single integer video setting on the camera.
@@ -441,6 +444,8 @@ private:
   // <---- Fusion module
 
   uint64_t mFrameCount = 0;
+  bool mPcFrame = false;         // Point cloud retrieved on the current grab (see isPointCloudFrame())
+  double mNextPcTime_sec = 0.0;  // Scheduled time of the next point cloud grab
   uint32_t mSvoLoopCount = 0;
 
   // ----> Topics
@@ -775,7 +780,7 @@ private:
   int mCamWBTemp = 42;
   int mDepthConf = 95;
   int mDepthTextConf = 100;
-  double mPcPubRate = 10.0;
+  std::atomic<double> mPcPubRate{10.0};
   double mFusedPcPubRate = 1.0;
   bool mRemoveSatAreas = true;
 
@@ -1172,6 +1177,7 @@ private:
   std::atomic<bool> mObjDetRunning{false};
   std::atomic<bool> mBodyTrkRunning{false};
   bool mRgbSubscribed = false;
+  bool mDepthRetrieved = false;   // Depth data retrieved with the latest video/depth data
   bool mGnssMsgReceived = false;  // Indicates if a NavSatFix topic has been
                                   // received, also with invalid position fix
   bool mGnssFixValid = false;     // Used to keep track of signal loss
@@ -1249,7 +1255,6 @@ private:
   sl_tools::StopWatch mMagFreqTimer;
   sl_tools::StopWatch mOdomFreqTimer;
   sl_tools::StopWatch mPoseFreqTimer;
-  sl_tools::StopWatch mPcPubFreqTimer;
   sl_tools::StopWatch mVdPubFreqTimer;
   sl_tools::StopWatch mSensPubFreqTimer;
   sl_tools::StopWatch mOdFreqTimer;
