@@ -5873,7 +5873,8 @@ bool ZedCamera::publishSensorsData(rclcpp::Time force_ts)
   sl::SensorsData sens_data;
   sl::ERROR_CODE err;
 
-  if (mSensCameraSync) {
+  // SVO: only TIME_REFERENCE::IMAGE returns a correct IMU orientation
+  if (mSensCameraSync || mSvoMode) {
     err = mZed->getSensorsData(sens_data, sl::TIME_REFERENCE::IMAGE);
   } else {
     err = mZed->getSensorsData(sens_data, sl::TIME_REFERENCE::CURRENT);
